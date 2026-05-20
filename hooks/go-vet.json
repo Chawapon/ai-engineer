@@ -1,0 +1,12 @@
+﻿{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "type": "command",
+        "windows": "powershell -ExecutionPolicy Bypass -File .github/hooks/go-vet.ps1",
+        "command": "bash -c 'go vet ./... 2>&1'",
+        "timeout": 30
+      }
+    ]
+  }
+}

@@ -1,0 +1,112 @@
+﻿name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}:${{ github.sha }}
+
+jobs:
+  # ── Stage 1 & 2: Lint + Test ────────────────────────────────────────────────
+  lint-test:
+    name: Lint & Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod   # reads go 1.24.2 from go.mod — never hardcode
+          cache: true
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test ./...
+
+  # ── Stage 3 & 4: Build + Scan ───────────────────────────────────────────────
+  build-scan:
+    name: Build & Scan Image
+    needs: lint-test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write        # push to ghcr.io
+      security-events: write # upload SARIF to GitHub Security tab
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}   # no PAT needed for ghcr.io
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: ${{ github.ref == 'refs/heads/main' }}   # only push on main
+          tags: ${{ env.IMAGE }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Scan image for CVEs (Trivy)
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.IMAGE }}
+          exit-code: "1"            # block deploy on CRITICAL or HIGH findings
+          severity: CRITICAL,HIGH
+          format: sarif
+          output: trivy-results.sarif
+
+      - name: Upload Trivy SARIF to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()               # upload even if trivy found issues
+        with:
+          sarif_file: trivy-results.sarif
+
+  # ── Stage 5, 6 & 7: Deploy ──────────────────────────────────────────────────
+  deploy:
+    name: Deploy to Kubernetes
+    if: github.ref == 'refs/heads/main'
+    needs: build-scan
+    runs-on: ubuntu-latest
+    environment: production        # requires manual approval in GitHub Environments
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/setup-kubectl@v4
+
+      - name: Validate manifests (dry-run)
+        env:
+          KUBECONFIG: ${{ secrets.KUBECONFIG }}
+        run: kubectl apply --dry-run=server -f deploy/
+
+      - name: Pin image tag in deployment manifest
+        run: |
+          sed -i "s|image: ghcr.io/.*|image: ${{ env.IMAGE }}|" deploy/deployment.yaml
+
+      - name: Apply manifests
+        env:
+          KUBECONFIG: ${{ secrets.KUBECONFIG }}
+        run: kubectl apply -f deploy/
+
+      - name: Verify rollout
+        env:
+          KUBECONFIG: ${{ secrets.KUBECONFIG }}
+        run: kubectl rollout status deployment/ai-engineer --timeout=120s
+
+      - name: Notify on failure
+        if: failure()
+        uses: slackapi/slack-github-action@v2
+        with:
+          payload: |
+            {"text": "Deploy failed: ${{ github.run_url }}"}
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
