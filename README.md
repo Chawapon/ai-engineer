@@ -1,4 +1,4 @@
-﻿# ai-engineer
+# AI Engineer
 
 Go microservice with Clean Architecture and Oracle DB backend.
 
